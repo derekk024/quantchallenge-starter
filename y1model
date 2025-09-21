@@ -1,0 +1,311 @@
+import time
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import List, Dict
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import r2_score
+
+from xgboost import XGBRegressor
+
+#config
+TIME_COL = "time"
+TARGET_Y = "Y1"
+FEATURES = [c for c in list("ABCDEFGHIJKLMN")]
+OOS_SIZE = 15996
+
+LAGS = [1, 2, 5, 10, 20]
+ROLL_WINDOWS = [10, 20, 40, 60, 126]
+Y1_LAGS = [1, 5, 10, 20]
+Y1_ROLL_WINS = [10, 20, 60]
+PAIR_SPREADS = [("G", "J"), ("G", "H"), ("J", "H"), ("C", "M"), ("E", "M")]
+ROC_WINS = [1, 5, 10, 20]
+CHANNEL_WINS = [20, 60]
+ADD_PAIR_CORR = [("G", "H")]
+PAIR_CORR_WINS = [20, 60]
+REGIME_BASE = "G"
+VOL_WINS = [10, 20, 60, 126]
+EMA_ALPHAS = [0.1]
+ZSCORE_WINS = [10, 20, 60]
+
+IS_VAL_FRACTION = 0.12
+N_THREADS = -1
+
+XGB_PARAMS = {
+    "max_depth": 6,
+    "min_child_weight": 5,
+    "subsample": 0.9,
+    "colsample_bytree": 0.8,
+    "colsample_bynode": 0.8,
+    "reg_lambda": 6.0,
+    "reg_alpha": 0.2,
+    "eta": 0.01,
+    "n_estimators": 20000,
+}
+EARLY_STOP_ROUNDS = 400
+SEED = 42
+TOP_K_FEATURES_TO_PRINT = 50
+
+#Time-decay weights
+HALF_LIFE = 126
+@dataclass
+class FeatureSpec:
+    lag_list: List[int]
+    roll_windows: List[int]
+    base_cols: List[str]
+
+class FeatureMaker(BaseEstimator, TransformerMixin) :
+    def __init__(self, spec: FeatureSpec, set_name: str):
+        self.spec = spec
+        self.set_name = set_name
+        self.max_needed = max(self.spec.lag_list + self.spec.roll_windows) if (self.spec.lag_list or self.spec.roll_windows) else 0
+        self.is_tail_X_ = None
+        self.is_tail_y1_ = None
+        self.is_tail_time_ = None
+        self.out_cols_: List[str] = []
+
+    def fit(self, X: pd.DataFrame, y = None):
+        if self.max_needed > 0:
+            self.is_tail_X_ = X[self.spec.base_cols].iloc[-self.max_needed:].copy()
+            self.is_tail_time_ = X[TIME_COL].iloc[-self.max_needed:].copy() if TIME_COL in X.columns else None
+            if TARGET_Y in X.columns:
+                self.is_tail_y1_ = X[TARGET_Y].iloc[-self.max_needed:].copy()
+        tmp = self._featurize_internal(X).dropna().reset_index(drop=True)
+        self.out_cols_ = tmp.columns.tolist()
+        return self
+    
+    def transform(self, X: pd.DataFrame):
+        if self.set_name == "IS":
+            feats = self._featurize_internal(X).dropna().reset_index(drop = True)
+            return feats[self.out_cols_]
+        if self.max_needed > 0 and self.is_tail_X_ is not None:
+            base_cat = pd.concat([self.is_tail_X_, X[self.spec.base_cols]], axis=0, ignore_index = True)
+            cat = pd.DataFrame(base_cat, columns = self.spec.base_cols)
+            if self.is_tail_time_ is not None and TIME_COL in X.columns:
+                time_cat = pd.concat([self.is_tail_time_, X[TIME_COL]], axis = 0, ignore_index = True)
+                cat[TIME_COL] = time_cat.values
+            if self.is_tail_y1_ is not None and TARGET_Y in X.columns:
+                y1_cat = pd.concat([self.is_tail_y1_, X[TARGET_Y]], axis = 0, ignore_index=True)
+                cat[TARGET_Y] = y1_cat.values
+            feats_all = self._featurize_internal(cat)
+            feats = feats_all.iloc[self.max_needed:].reset_index(drop = True)
+        else:
+            feats = self._featurize_internal(X)
+        return feats[self.out_cols_]
+
+    def _featurize_internal(self, X: pd.DataFrame) -> pd.DataFrame:
+        cols: Dict[str, np.ndarray] = {}
+        for c in self.spec.base_cols:
+            s = X[c].astype(float)
+            cols[c] = s.to_numpy()
+            for k in self.spec.lag_list:
+                cols[f"{c}_lag{k}"] = s.shift(k).to_numpy()
+            for w in self.spec.roll_windows:
+                roll = s.rolling(w)
+                cols[f"{c}_rmean{w}"] = roll.mean().to_numpy()
+                cols[f"{c}_rstd{w}"] = roll.std(ddof = 0).to_numpy()
+            for a in EMA_ALPHAS:
+                tag = str(a).replace('.', 'p')
+                cols[f"{c}_ema{tag}"] = s.ewm(alpha=a, adjust=False).mean().to_numpy()
+            for w in ZSCORE_WINS:
+                roll = s.rolling(w)
+                mu = roll.mean(); sd = roll.std(ddof = 0)
+                cols[f"{c}_z{w}"] = ((s - mu) / (sd.replace(0, np.nan))).to_numpy()
+                denom = s.shift(w).replace(0, np.nan).abs()
+                cols[f"{c}_roc{w}"] = ((s - s.shift(w)) / (denom + 1e-8)).clip(-5, 5).to_numpy()
+            for w in CHANNEL_WINS:
+                r = s.rolling(w)
+                mn, mx = r.min(), r.max()
+                rng = (mx - mn).replace(0, np.nan)
+                cols[f"{c}_chpos{w}"] = ((s - mn) / rng).to_numpy()
+
+
+                # pair spreads + z rolling corr
+            for a, b in PAIR_SPREADS:
+                s1 = X[a].astype(float); s2 = X[b].astype(float)
+                sp = (s1 - s2)
+                cols[f"{a}_minus_{b}"] = sp.to_numpy()
+                cols[f"{a}_minus_{b}_ema0p1"] = sp.ewm(alpha = 0.1, adjust = False).mean().to_numpy()
+                for w in ZSCORE_WINS:
+                    roll = sp.rolling(w)
+                    mu = roll.mean(); sd = roll.std(ddof = 0)
+                    cols[f"{a}_minus{b}_z{w}"] = ((sp - mu) / (sd.replace(0, np.nan))).to_numpy()
+                    for (a, b) in ADD_PAIR_CORR:
+                        s1, s2 = X[a].astype(float), X[b].astype(float)
+                        for w in PAIR_CORR_WINS:
+                            cols[f"{a}_{b}_corr{w}"] = s1.rolling(w).corr(s2).to_numpy()
+
+                    comp = X[self.spec.base_cols].astype(float).mean(axis=1)
+                    def realized_vol(series, w):
+                        ret = series.diff()
+                        return ret.rolling(w).std(ddof = 0)
+                    anchors = {}
+                    if REGIME_BASE in X.columns:
+                        anchors["anchor"] = X[REGIME_BASE].astype(float)
+                    anchors["comp"] = comp
+                    for tag, ser in anchors.items():
+                        for w in VOL_WINS:
+                            rv = realized_vol(ser, w)
+                            cols[f"vol_{tag}_{w}"] = rv.to_numpy()
+                            mu = rv.rolling(5*w//10 if w >= 10 else w).mean()
+                            sd = rv.rolling(5*w//10 if w >= 10 else w).std(ddof = 0)
+                            cols[f"vol_{tag}_{w}_z"] = ((rv - mu) / (sd.replace(0, np.nan))).to_numpy()
+                            ema = ser.ewm(span = max(2, w//2), adjust = False).mean()
+                            rmean = ser.rolling(w).mean()
+                            rstd = ser.rolling(w).std(ddof = 0).replace(0, np.nan)
+                            cols[f"trendstr_{tag}_{w}"] = (ema - rmean).abs().div(rstd).to_numpy()
+                    base_vol = pd.Series(cols["vol_comp_20"])
+                    if base_vol.notna().any():
+                        ranks = base_vol.rank(method = "first", pct = True)
+                        for i in range(10):
+                            lo, hi = i/10.0, (i + 1)/10.0
+                            cols[f"volbucket_{i}"] = ((ranks > lo) & (ranks <= hi)).astype(float).to_numpy()
+
+                    if TIME_COL in X.columns:
+                        t = X[TIME_COL].astype(float)
+                        t_norm = (t - t.min()) / max(1e-9, (t.max() - t.min()))  
+                        cols["t_norm"] = t_norm.to_numpy()
+                        cols["t_norm2"] = (t_norm**2).to_numpy()
+                        cols["t_norm3"] = (t_norm**3).to_numpy()
+                        for P in (5, 21, 63, 126, 252):
+                            phase = 2*np.pi*t_norm*(len(X)/P)
+                            cols[f"t_sin_{P}"] = np.sin(phase).to_numpy()
+                            cols[f"t_cos_{P}"] = np.cos(phase).to_numpy()
+
+                    if TARGET_Y in X.columns:
+                        y = X[TARGET_Y].astype(float)
+                        for k in Y1_LAGS:
+                            cols[f"{TARGET_Y}_lag{k}"] = y.shift(k).to_numpy()
+                        for w in Y1_ROLL_WINS:
+                            roll = y.rolling(w)
+                            mu = roll.mean(); sd = roll.std(ddof=0)
+                            cols[f"{TARGET_Y}_rmean{w}"] = mu.to_numpy()
+                            cols[f"{TARGET_Y}_rstd{w}"] = sd.to_numpy()
+                            cols[f"{TARGET_Y}_z{w}"] = ((y - mu) / (sd.replace(0, np.nan))).to_numpy()
+                    return pd.DataFrame(cols, index = X.index)
+            def make_xgb(params: dict, seed: int) -> XGBRegressor:
+                return XGBRegressor(
+                    n_estimators = params.get("n_estimators", 20000),
+                    max_depth = params.get("max_depth", 6),
+                    min_child_weight = params.get("min_child_weight", 5),
+                    subsample = params.get("subsample", 0.9),
+                    colsample_bytree = params.get("colsample_bytree", 0.8),
+                    colsample_bynode = params.get("colsample_bynode", 0.8),
+                    reg_lambda = params.get("reg_lambda", 6.0),
+                    reg_alpha = params.get("reg_alpha", 0.2),
+                    gamma = params.get("gamma", 0.0),
+                    learning_rate = params.get("eta", 0.01),
+                    objective = "reg:squarederror",
+                    n_jobs = N_THREADS,
+                    random_state = seed,
+                    tree_method = "gpu_hist",
+                    predictor = "gpu_predictor",
+                    max_bin = params.get("max_bin", 256),
+                    verbosity = 0,
+
+                    eval_metric = "rmse",
+                    early_stopping_rounds = EARLY_STOP_ROUNDS,
+                )
+            
+            def fit_y1 (params: dict, seed: int, X_tr, y_tr, X_va, y_va, X_te, sample_weight = None):
+                model = make_xgb(params, seed)
+                model.fit(
+                    X_tr, y_tr,
+                    eval_set = [(X_va, y_va)],
+                    sample_weight = sample_weight,
+                    verbose = False,
+                )
+                bi = getattr(model, "best_iteration", None)
+                if bi is not None:
+                    p_va = model.predict(X_va, iteration_range = (0, bi + 1))
+                    p_te = model.predict(X_te, iteration_range = (0, bi + 1))
+                else:
+                    p_va = model.predict(X_va)
+                    p_te = model.predict(X_te)
+                return p_va, p_te, model
+            
+
+            #main
+            def main():
+                t0 = time.time()
+                df = pd.read_csv("train.csv")
+
+                is_df = df.iloc[:-OOS_SIZE].reset_index(drop = True)
+                oos_df = df.iloc[-OOS_SIZE:].reset_index(drop=True)
+
+                spec = FeatureSpec(lag_list = LAGS, roll_windows = ROLL_WINDOWS, base_cols = FEATURES)
+                fm_is = FeatureMaker(spec, set_name = "IS").fit(is_df)
+                X_is = fm_is.transform(is_df)
+                y_is = is_df[TARGET_Y].iloc[-len(X_is):].to_numpy()
+
+                fm_oos = FeatureMaker(spec, set_name = "OOS")
+                if fm_is.max_needed > 0:
+                    fm_oos.is_tail_X_ = is_df[FEATURES].iloc[-fm_is.max_needed:].copy()
+                    fm_oos.is_tail_time_ = is_df[TIME_COL].iloc[-fm_is.max_needed:].copy() if TIME_COL in is_df.columns else None
+                    if TARGET_Y in is_df.columns:
+                        fm_oos.is_tail_y1_ = is_df[TARGET_Y].iloc[-fm_is.max_needed:].copy()
+                fm_oos.out_cols_ = fm_is.out_cols_.copy()
+                X_oos = fm_oos.transform(oos_df)
+                y_oos = oos_df[TARGET_Y].to_numpy()
+
+                #impute NANS
+                imp = SimpleImputer(strategy="median")
+                X_is_imp_arr = imp.fit_transform(X_is)
+                X_oos_imp_arr = imp.transform(X_oos)
+                X_is_imp = pd.DataFrame(X_is_imp_arr, columns = X_is.columns, index = X_is.index)
+                X_oos_imp = pd.DataFrame(X_oos_imp_arr, columns = X_oos.columns, index = X_oos.index)
+
+                n_is = len(X_is_imp)
+                val_sz = max(2000, int(IS_VAL_FRACTION * n_is))
+                tr_end = n_is - val_sz
+                X_tr, X_va = X_is_imp.iloc[:tr_end], X_is_imp.iloc[tr_end:]
+                y_tr, y_va = y_is[:tr_end],        y_is[tr_end:]
+
+
+                n_tr = len(X_tr)
+                decay = np.log(2) /max(1, HALF_LIFE)
+
+                w_tr = np.exp(decay * (np.arange(n_tr) - n_tr))
+                best_params = XGB_PARAMS
+                print(f"[XGB] Using fixed params = {best_params}")
+                p_va, p_te, model = fit_y1(best_params, seed = SEED, X_tr = X_tr, y_tr = y_tr, X_va = X_va, y_va = y_va, X_te = X_oos_imp, sample_weight = w_tr)
+                
+                #scores
+                r2_va = r2_score(y_va, p_va)
+                r2_oos = r2_score(y_oos, p_te)
+                print(f"[VAL] R2_Y1 = {r2_va:.5f}")
+                print(f"[OOS] R2_Y1 = {r2_oos:.5f}")
+
+                booster = model.get_booster()
+                gain_map = booster.get_score(importance_type = "gain")
+                feat_names = X_tr.columns.tolist()
+                gains = np.array([gain_map.get(f"f{i}", 0.0) for i in range(len(feat_names))])
+                order = np.argsort(gains)[::-1][:TOP_K_FEATURES_TO_PRINT]
+
+                print("\n[XGBoost top features by gain]")
+                for idx in order:
+                    if gains[idx] <= 0:
+                        continue
+                    print(f"{feat_names[idx]:28s} {gains[idx]:.6f}")
+
+                print("\n[Device] gpu_hist / gpu_predictor")
+
+                print(f"\n[Timing] Total elapsed {time.time()-t0:.1f}s")
+
+                if __name__ == "__main__":
+                    main()
+
+
+                             
+
+                
+
+
+
+
+
+
+
+
